@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# rora v1.7.2 — perf
+# rora v1.7.3 — perf + QuickEdit fix + focus-aware output
 # commands:
 #   /new  /sessions  /switch <n>  /delete <n>  /purge  /rename <title>
 #   /models  /model [<n>]  /reload-prompt  /config
@@ -20,6 +20,7 @@ import webbrowser
 import urllib.parse
 import threading
 import inspect
+import ctypes
 from pathlib import Path
 from datetime import datetime
 
@@ -47,16 +48,67 @@ def _maybe_relaunch_in_cmd():
         return False
 
 
-if os.name == "nt":
+# ---------- Windows console setup ----------
+def _setup_windows_console():
+    """Включает VT, отключает QuickEdit (главный фикс зависаний)."""
+    if os.name != "nt":
+        return
     try:
-        import ctypes
         k = ctypes.windll.kernel32
-        h = k.GetStdHandle(-11)
-        m = ctypes.c_ulong()
-        k.GetConsoleMode(h, ctypes.byref(m))
-        k.SetConsoleMode(h, m.value | 0x0004)
+        # output handle: включить виртуальный терминал (цвета/ANSI)
+        h_out = k.GetStdHandle(-11)
+        m_out = ctypes.c_ulong()
+        k.GetConsoleMode(h_out, ctypes.byref(m_out))
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        k.SetConsoleMode(h_out, m_out.value | 0x0004)
+
+        # input handle: выключить QuickEdit (иначе cmd замерзает при клике)
+        h_in = k.GetStdHandle(-10)
+        m_in = ctypes.c_ulong()
+        k.GetConsoleMode(h_in, ctypes.byref(m_in))
+        # ENABLE_EXTENDED_FLAGS = 0x0080 -> включает явное управление
+        # ENABLE_QUICK_EDIT_MODE = 0x0040 -> выключить
+        new_mode = (m_in.value | 0x0080) & ~0x0040
+        k.SetConsoleMode(h_in, new_mode)
     except Exception:
         pass
+
+
+def _is_console_visible():
+    """True если окно консоли не свёрнуто и видимо."""
+    if os.name != "nt":
+        return True
+    try:
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        hwnd = k.GetConsoleWindow()
+        if not hwnd:
+            return True
+        if u.IsIconic(hwnd):
+            return False
+        return bool(u.IsWindowVisible(hwnd))
+    except Exception:
+        return True
+
+
+_vis_state = True
+_vis_last_check = 0.0
+
+
+def is_visible_cached():
+    """Кэшируем проверку видимости — раз в 200мс."""
+    global _vis_state, _vis_last_check
+    now = time.time()
+    if now - _vis_last_check < 0.2:
+        return _vis_state
+    _vis_last_check = now
+    _vis_state = _is_console_visible()
+    return _vis_state
+
+
+_setup_windows_console()
+
+if os.name == "nt":
     try:
         os.system("chcp 65001 >nul 2>&1")
     except Exception:
@@ -91,6 +143,7 @@ def lerp(c1, c2, t):
     )
 
 
+# ---- базовые цвета. Заполняются apply_theme() ----
 C_ACCENT = rgb(100, 170, 255)
 C_LIGHT = rgb(150, 210, 255)
 C_DEEP = rgb(35, 75, 180)
@@ -106,7 +159,6 @@ C_PURP = rgb(170, 90, 220)
 C_PURP_D = rgb(100, 40, 150)
 LOGO_COLORS = ((200, 235, 255), (90, 160, 255), (80, 150, 230), (30, 60, 150))
 BG_RGB = None
-
 
 NAMED_COLORS = {
     "black": (0, 0, 0), "white": (255, 255, 255),
@@ -400,13 +452,16 @@ THEMES_FILE = CONFIG_DIR / "themes.json"
 
 
 def _default_threads():
+    """Физические ядра (обычно половина от логических)."""
     n = os.cpu_count() or 4
+    if n >= 8:
+        return n // 2
     return max(1, n // 2) if n >= 4 else n
 
 
 DEFAULT_CONFIG = {
     "model": None, "models_dir": "~/models", "ctx": 4096, "gpu_layers": -1,
-    "threads": None, "temp": 0.2, "max_tokens": 2048, "chat_format": None,
+    "threads": None, "temp": 0.2, "max_tokens": 1536, "chat_format": None,
     "confirm": False, "theme": "basic", "theme_overrides": {},
 }
 
@@ -1147,9 +1202,9 @@ def notify(title, message):
     def _show():
         try:
             if os.name == "nt":
-                import ctypes
+                import ctypes as _ct
                 flags = 0x40 | 0x40000 | 0x10000
-                ctypes.windll.user32.MessageBoxW(0, str(message), str(title), flags)
+                _ct.windll.user32.MessageBoxW(0, str(message), str(title), flags)
             elif platform.system() == "Darwin":
                 subprocess.Popen([
                     "osascript", "-e",
@@ -1439,9 +1494,13 @@ class Spinner:
     def _spin(self):
         i = 0
         while not self.stop_flag.is_set():
-            frame = self.FRAMES[i % len(self.FRAMES)]
-            sys.stdout.write(f"\r{C_ACCENT}{frame}{R} {self.prefix}")
-            sys.stdout.flush()
+            if is_visible_cached():
+                frame = self.FRAMES[i % len(self.FRAMES)]
+                try:
+                    sys.stdout.write(f"\r{C_ACCENT}{frame}{R} {self.prefix}")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
             i += 1
             if self.stop_flag.wait(0.08):
                 break
@@ -1454,22 +1513,56 @@ class Spinner:
         self.stop_flag.set()
         if self.thread:
             self.thread.join(timeout=0.4)
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
 
-# ---------- PERF: buffered streaming ----------
+# ---------- PERF: buffered + focus-aware streaming ----------
 BUFFER_FLUSH_INTERVAL = 0.033
 BUFFER_FLUSH_SIZE = 200
+_pending_output = []
+_pending_lock = threading.Lock()
+
+
+def _write_now(s):
+    """Пишем в stdout только если окно видимо. Иначе копим."""
+    if not s:
+        return
+    if is_visible_cached():
+        try:
+            sys.stdout.write(s)
+            sys.stdout.flush()
+        except Exception:
+            with _pending_lock:
+                _pending_output.append(s)
+    else:
+        with _pending_lock:
+            _pending_output.append(s)
+
+
+def _drain_pending():
+    """Сбрасываем буфер когда окно снова видимо."""
+    global _pending_output
+    if not is_visible_cached():
+        return
+    with _pending_lock:
+        if not _pending_output:
+            return
+        buf = "".join(_pending_output)
+        _pending_output = []
+    try:
+        sys.stdout.write(buf)
+        sys.stdout.flush()
+    except Exception:
+        with _pending_lock:
+            _pending_output.insert(0, buf)
 
 
 def stream_chat(llm, messages, max_tokens, temperature,
                 spinner=None, buffered=True):
-    """
-    Streams model output.
-    buffered=True -> вывод копится ~33ms и пишется одним куском (быстро на Windows).
-    buffered=False -> писать каждый чанк сразу (медленнее, но видно посимвольно).
-    """
     full = ""
     sf = StreamFilter()
     first_token = True
@@ -1482,8 +1575,7 @@ def stream_chat(llm, messages, max_tokens, temperature,
         nonlocal out_size, last_flush
         if not out_parts:
             return
-        sys.stdout.write("".join(out_parts))
-        sys.stdout.flush()
+        _write_now("".join(out_parts))
         out_parts.clear()
         out_size = 0
         last_flush = time.time()
@@ -1509,8 +1601,7 @@ def stream_chat(llm, messages, max_tokens, temperature,
                 continue
 
             if not buffered:
-                sys.stdout.write(safe)
-                sys.stdout.flush()
+                _write_now(safe)
                 continue
 
             out_parts.append(safe)
@@ -1527,28 +1618,23 @@ def stream_chat(llm, messages, max_tokens, temperature,
             if buffered:
                 out_parts.append(tail)
             else:
-                sys.stdout.write(tail)
-                sys.stdout.flush()
+                _write_now(tail)
 
     except KeyboardInterrupt:
-        if not buffered:
-            print(f"\n{C_YEL}~ interrupted{R}")
-        else:
+        if buffered:
             flush_now()
-            print(f"\n{C_YEL}~ interrupted{R}")
+        _write_now(f"\n{C_YEL}~ interrupted{R}\n")
     finally:
         if first_token and spinner is not None:
             spinner.stop()
         if buffered:
             flush_now()
 
-    if not buffered or out_size:
-        pass
-    print()
+    _write_now("\n")
     return full
 
 
-def trim_messages(messages, keep_last=40):
+def trim_messages(messages, keep_last=24):
     if len(messages) <= keep_last + 1:
         return messages
     return [messages[0]] + messages[-keep_last:]
@@ -1559,14 +1645,15 @@ def build_llm(model_path, cfg):
     if not n_threads:
         n_threads = _default_threads()
     n_ctx = int(cfg.get("ctx") or 4096)
+    n_gpu = int(cfg.get("gpu_layers", -1))
 
     kwargs = dict(
         model_path=model_path,
         n_ctx=n_ctx,
-        n_gpu_layers=int(cfg.get("gpu_layers", -1)),
+        n_gpu_layers=n_gpu,
         n_threads=int(n_threads),
-        n_batch=1024,
-        n_ubatch=512,
+        n_batch=256,
+        n_ubatch=256,
         use_mlock=True,
         use_mmap=True,
         verbose=False,
@@ -1576,18 +1663,18 @@ def build_llm(model_path, cfg):
     if cf:
         kwargs["chat_format"] = cf
 
-    # flash_attn только если сборка поддерживает
-    try:
-        sig = inspect.signature(Llama.__init__)
-        if "flash_attn" in sig.parameters:
-            kwargs["flash_attn"] = True
-    except Exception:
-        pass
+    # flash_attn только если реально есть GPU-слои
+    if n_gpu != 0:
+        try:
+            sig = inspect.signature(Llama.__init__)
+            if "flash_attn" in sig.parameters:
+                kwargs["flash_attn"] = False
+        except Exception:
+            pass
 
     try:
         return Llama(**kwargs)
     except TypeError:
-        # какая-то из опций не поддерживается — убираем по одной
         for key in ("flash_attn", "n_ubatch", "use_mlock"):
             kwargs.pop(key, None)
         return Llama(**kwargs)
@@ -1717,7 +1804,7 @@ def render_welcome(model_path, sess, cfg, n_models):
     right_body.append(f"  {C_DIM}temp{R}    {C_WHITE}{cfg.get('temp')}{R}")
 
     h = max(len(left_body), len(mid_body), len(right_body))
-    left_box  = make_box("Rora v1.7.2", left_body, W_L, C_ACCENT, C_LIGHT)
+    left_box  = make_box("Rora v1.7.3", left_body, W_L, C_ACCENT, C_LIGHT)
     mid_box   = make_box("sessions",  mid_body,  W_M, C_DIM,    C_ACCENT)
     right_box = make_box("meta",      right_body, W_R, C_DIM,    C_ACCENT)
 
@@ -1754,7 +1841,8 @@ def render_welcome(model_path, sess, cfg, n_models):
             val_str = "..." + val_str[-(max_val - 3):]
         lines.append(prefix + "  " + vv + val_str + R)
     lines.append("")
-    status_box = make_box("info", lines, W_STATUS, C_PURP_D, C_ACCENT)
+    # INFO бокс — голубая рамка (было фиолетовое)
+    status_box = make_box("info", lines, W_STATUS, C_ACCENT, C_LIGHT)
     for line in status_box:
         print(line)
     print()
@@ -1799,7 +1887,7 @@ def print_tool_call(name, args):
     brief = format_call_brief(name, args)
     if len(brief) > 78:
         brief = brief[:75] + "..."
-    print(f"  {C_PURP}○{R} {B}{C_LIGHT}{name}{R}  {C_DIM}{brief}{R}")
+    print(f"  {C_ACCENT}○{R} {B}{C_LIGHT}{name}{R}  {C_DIM}{brief}{R}")
 
 
 def print_tool_result(result):
@@ -1823,8 +1911,8 @@ def print_status_line(model_path, elapsed, reply_chars):
     width = 70
     line_len = vis_len(body)
     left_pad = max(0, (width - line_len) // 2)
-    print(f"\n{C_PURP_D}{'─' * left_pad}{R}{body}"
-          f"{C_PURP_D}{'─' * max(0, width - line_len - left_pad)}{R}\n")
+    print(f"\n{C_ACCENT}{'─' * left_pad}{R}{body}"
+          f"{C_ACCENT}{'─' * max(0, width - line_len - left_pad)}{R}\n")
 
 
 def show_sessions(sessions, current_id):
@@ -2021,7 +2109,7 @@ def show_help():
         f"  {C_LIGHT}/reload-prompt{R}    {C_DIM}reload system_prompt.txt{R}",
         f"  {C_LIGHT}/config{R}           {C_DIM}show config paths{R}",
         "",
-    ], W, C_PURP, C_ACCENT)
+    ], W, C_ACCENT, C_LIGHT)
     box3 = make_box("theme", [
         "",
         f"  {C_LIGHT}/theme{R}            {C_DIM}list themes{R}",
@@ -2031,7 +2119,7 @@ def show_help():
         f"  {C_LIGHT}/theme reset{R}      {C_DIM}drop overrides{R}",
         f"  {C_LIGHT}/theme save <name>{R} {C_DIM}save as preset{R}",
         "",
-    ], W, C_ACCENT, C_PURP)
+    ], W, C_ACCENT, C_LIGHT)
     box4 = make_box("shell & fs", [
         "",
         f"  {C_LIGHT}/cd <path>{R}        {C_DIM}change cwd{R}",
@@ -2054,6 +2142,9 @@ def main():
         print("launched")
         sys.exit(0)
 
+    # повторно применяем настройки консоли в новом окне
+    _setup_windows_console()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model")
     ap.add_argument("--models-dir", default=None)
@@ -2068,8 +2159,7 @@ def main():
     ap.add_argument("--session", default=None)
     ap.add_argument("--theme", default=None)
     ap.add_argument("--no-relaunch", action="store_true")
-    ap.add_argument("--no-buffer", action="store_true",
-                    help="disable output buffering (slower, for debugging)")
+    ap.add_argument("--no-buffer", action="store_true")
     args = ap.parse_args()
 
     ensure_config_files()
@@ -2372,11 +2462,11 @@ def main():
             spinner = Spinner(f"{C_CYAN}{B}rora{R}{C_DIMMER} ›{R}")
             spinner.start()
             reply = stream_chat(llm, trimmed,
-                                int(cfg.get("max_tokens") or 2048),
+                                int(cfg.get("max_tokens") or 1536),
                                 float(cfg.get("temp") or 0.2),
                                 spinner=spinner, buffered=buffered)
             if not reply.strip():
-                print(f"{C_CYAN}{B}rora{R}{C_DIMMER} ›{R} {C_DIMMER}(no output){R}")
+                _write_now(f"{C_CYAN}{B}rora{R}{C_DIMMER} ›{R} {C_DIMMER}(no output){R}\n")
             reply_chars += len(reply)
             calls = parse_tool_calls(reply)
             sess["messages"].append({"role": "assistant", "content": reply})
